@@ -86,7 +86,9 @@ float lastStablePh = 7.0;
 bool manualPump1   = false;
 bool manualPump2   = false;
 bool manualTdsPump = false;
-bool manualLED     = false;
+
+// LED modes: 0 = off, 1 = white (normal), 2 = red (alert/forced)
+uint8_t ledMode = 0;
 
 unsigned long readChannel(int pin) {
   unsigned long total = 0;
@@ -138,7 +140,7 @@ void espNowSendData() {
     addField(pkt, "TDS Pump", "",    digitalRead(TDS_PUMP)  == LOW ? 1.0f : 0.0f, 1);
     addField(pkt, "pH Pump1", "",    digitalRead(PH_PUMP_1) == LOW ? 1.0f : 0.0f, 1);
     addField(pkt, "pH Pump2", "",    digitalRead(PH_PUMP_2) == LOW ? 1.0f : 0.0f, 1);
-    addField(pkt, "LED",      "",    (currentData.isGreen || manualLED) ? 1.0f : 0.0f, 1);
+    addField(pkt, "LED",      "",    (ledMode > 0) ? 1.0f : 0.0f, 1);
     
     Serial.printf("[ESP-NOW] pkt.fieldCount=%d groupName='%s'\n", pkt.fieldCount, pkt.groupName);
     esp_now_send(receiverMAC, (uint8_t*)&pkt, sizeof(pkt));
@@ -218,11 +220,6 @@ void loop() {
 
   if (WiFi.status() == WL_CONNECTED) server.handleClient();
 
-  if (manualLED) {
-    fill_solid(leds, NUM_LEDS, CRGB::White);
-    FastLED.show();
-  }
-
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
     lastSensorRead = now;
 
@@ -256,12 +253,14 @@ void loop() {
       Serial.printf("[COLOR] R:%lu G:%lu B:%lu | score:%.1f%%%s\n",
         rVal, gVal, bVal, greenScore, isGreen ? " << GREEN!" : "");
     }
-    if (!manualLED) {
+    if (ledMode == 1) {  // Only auto-control when in white/auto mode
       if (isGreen) {
         colorStatus = "GREEN DETECTED";
         fill_solid(leds, NUM_LEDS, CRGB::Red);
+        ledMode = 2;  // Auto switch to red if green detected
       } else {
         fill_solid(leds, NUM_LEDS, CRGB::White);
+        ledMode = 1;  // Keep in white mode
       }
       FastLED.show();
     }
@@ -397,9 +396,17 @@ void handleManual() {
   if (doc.containsKey("pump1"))   manualPump1   = doc["pump1"].as<bool>();
   if (doc.containsKey("pump2"))   manualPump2   = doc["pump2"].as<bool>();
   if (doc.containsKey("tdspump")) manualTdsPump = doc["tdspump"].as<bool>();
-  if (doc.containsKey("led")) {
-    manualLED = doc["led"].as<bool>();
-    if (!manualLED) { fill_solid(leds, NUM_LEDS, CRGB::White); FastLED.show(); }
+  if (doc.containsKey("ledMode")) {
+    uint8_t mode = doc["ledMode"].as<uint8_t>();
+    ledMode = mode;
+    if (mode == 0) {
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+    } else if (mode == 1) {
+      fill_solid(leds, NUM_LEDS, CRGB::White);
+    } else if (mode == 2) {
+      fill_solid(leds, NUM_LEDS, CRGB::Red);
+    }
+    FastLED.show();
   }
   server.send(200, "application/json", "{\"ok\":true}");
 }
@@ -417,7 +424,7 @@ void handleData() {
   doc["ph_voltage"]   = currentData.phVolt;
   doc["ph_status"]    = currentData.phStatus;
   doc["timestamp"]    = currentData.timestamp;
-  doc["manual_led"]   = manualLED;
+  doc["led_mode"]     = ledMode;
   String jsonString;
   serializeJson(doc, jsonString);
   server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -577,10 +584,12 @@ void handleRoot() {
   html += "<div class='manual-card'>";
   html += "<div class='manual-title'>Manual Override Controls</div>";
   html += "<div class='manual-btns'>";
-  html += "<button class='btn btn-base' onclick='triggerManual(\"pump2\")'>Dose Base &mdash; Pump 2</button>";
-  html += "<button class='btn btn-acid' onclick='triggerManual(\"pump1\")'>Dose Acid &mdash; Pump 1</button>";
-  html += "<button class='btn btn-tds'  onclick='triggerManual(\"tdspump\")'>Run Diaphragm Pump</button>";
-  html += "<button class='btn btn-led'  id='ledBtn' onclick='toggleLED()'>LED Strip: AUTO</button>";
+  html += "<button class='btn btn-base' onclick='setManual({pump2:true})'>Dose Base — Pump 2</button>";
+  html += "<button class='btn btn-acid' onclick='setManual({pump1:true})'>Dose Acid — Pump 1</button>";
+  html += "<button class='btn btn-tds'  onclick='setManual({tdspump:true})'>Run Diaphragm Pump</button>";
+  html += "<button class='btn btn-led' id='ledOffBtn' onclick='setLED(0)'>LED: OFF</button>";
+  html += "<button class='btn btn-led' id='ledWhiteBtn' onclick='setLED(1)'>LED: WHITE</button>";
+  html += "<button class='btn btn-led' id='ledRedBtn' onclick='setLED(2)'>LED: RED ALERT</button>";
   html += "<button class='btn btn-refresh' onclick='updateData()'>Refresh Now</button>";
   html += "</div></div>";
 
@@ -599,8 +608,6 @@ void handleRoot() {
 
   // ── SCRIPT
   html += "<script>";
-  html += "var ledOn=false;";
-
   html += "function clamp(v,mn,mx){return Math.min(Math.max(v,mn),mx);}";
 
   html += "function setCard(id,cls){var c=document.getElementById(id);c.className='card '+cls;}";
@@ -608,9 +615,9 @@ void handleRoot() {
   html += "function setOutTag(id,cls,txt){var t=document.getElementById(id);t.className='out-tag '+cls;t.textContent=txt;}";
   html += "function setHW(id,cls,txt){var h=document.getElementById(id);h.className='hw-circle '+cls;h.textContent=txt;}";
 
-  html += "function triggerManual(w){var b={};b[w]=true;fetch('/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).catch(function(e){console.error(e);});}";
+  html += "function setManual(obj){fetch('/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)}).then(function(){setTimeout(updateData,200);}).catch(function(e){console.error(e);});}";
 
-  html += "function toggleLED(){ledOn=!ledOn;var btn=document.getElementById('ledBtn');btn.textContent=ledOn?'LED Strip: FORCED ON':'LED Strip: AUTO';btn.className=ledOn?'btn btn-led on':'btn btn-led';fetch('/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({led:ledOn})}).catch(function(e){console.error(e);});}";
+  html += "function setLED(mode){fetch('/manual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ledMode:mode})}).then(function(){setTimeout(updateData,200);}).catch(function(e){console.error(e);});}";
 
   html += "function updateData(){fetch('/data').then(function(r){return r.json();}).then(function(d){";
 
@@ -622,17 +629,25 @@ void handleRoot() {
   // ── Color sensor
   html += "var r=d.r_frequency||0,g=d.g_frequency||0,b=d.b_frequency||0;";
   html += "var greenPct=d.green_pct||0;";
+  html += "var ledMode=d.led_mode||0;";
   html += "document.getElementById('greenPct').innerHTML=greenPct.toFixed(1)+' %';";
   html += "document.getElementById('greenBar').style.width=Math.min(greenPct,100)+'%';";
   html += "if(d.color_status&&d.color_status.indexOf('GREEN')>=0){";
   html += "  setCard('colorCard','alert-red');setPill('colorPill','pill-red','GREEN DETECTED');";
-  html += "  setOutTag('ledState','out-active','RED ALERT');setHW('hwLED','hw-alert','ALERT');";
   html += "  document.getElementById('hwLEDDesc').textContent='Algae detected!';";
   html += "}else{";
   html += "  setCard('colorCard','');setPill('colorPill','pill-green','CLEAR');";
-  html += "  if(!ledOn){setOutTag('ledState','out-running','WHITE — NORMAL');setHW('hwLED','hw-active','ON');document.getElementById('hwLEDDesc').textContent='WS2812B — White';}";
-  html += "  else{setOutTag('ledState','out-warn','FORCED ON');setHW('hwLED','hw-warn','ON');document.getElementById('hwLEDDesc').textContent='Manual override';}";
   html += "}";
+  html += "if(ledMode===0){";
+  html += "  setOutTag('ledState','out-idle','DARK — OFF');setHW('hwLED','hw-idle','OFF');";
+  html += "}else if(ledMode===1){";
+  html += "  setOutTag('ledState','out-running','WHITE — NORMAL');setHW('hwLED','hw-active','ON');";
+  html += "}else if(ledMode===2){";
+  html += "  setOutTag('ledState','out-active','RED — ALERT');setHW('hwLED','hw-alert','ALERT');";
+  html += "}";
+  html += "document.getElementById('ledOffBtn').className='btn btn-led'+(ledMode===0?' on':'');";
+  html += "document.getElementById('ledWhiteBtn').className='btn btn-led'+(ledMode===1?' on':'');";
+  html += "document.getElementById('ledRedBtn').className='btn btn-led'+(ledMode===2?' on':'');";
 
   // ── TDS sensor
   html += "var tv=d.tds_value||0;";
@@ -676,8 +691,6 @@ void handleRoot() {
   html += "  setCard('phCard','');setPill('phPill','pill-green','BALANCED');";
   html += "}";
 
-  // LED sync
-  html += "if(d.manual_led!==undefined){ledOn=d.manual_led;var btn=document.getElementById('ledBtn');btn.textContent=ledOn?'LED Strip: FORCED ON':'LED Strip: AUTO';btn.className=ledOn?'btn btn-led on':'btn btn-led';}";
 
   html += "}).catch(function(){";
   html += "document.getElementById('connStatus').textContent='Offline';";
