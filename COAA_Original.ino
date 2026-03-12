@@ -66,6 +66,8 @@ struct SensorData {
   float phValue;
   float phVolt;
   String phStatus;
+  float greenPercentage;
+  bool isGreen;
   unsigned long timestamp;
 };
 SensorData currentData;
@@ -86,10 +88,6 @@ bool manualPump2   = false;
 bool manualTdsPump = false;
 bool manualLED     = false;
 
-// ── Helper: read TCS3200 frequency as pulse width (microseconds) ─
-// At 100% scaling, pulseIn reads the period directly.
-// LOWER value = HIGHER frequency = MORE of that color absorbed.
-// Returns 0 if no signal (sensor absent or no light).
 unsigned long readChannel(int pin) {
   unsigned long total = 0;
   int samples = 5;
@@ -135,13 +133,12 @@ void espNowSendData() {
     
     addField(pkt, "TDS",      "ppm", currentData.tdsValue, 0);
     addField(pkt, "pH",       "pH",  currentData.phValue,  0);
-    addField(pkt, "R Freq",   "hz",  (float)currentData.rFreq, 0);
-    addField(pkt, "G Freq",   "hz",  (float)currentData.gFreq, 0);
-    addField(pkt, "B Freq",   "hz",  (float)currentData.bFreq, 0);
+    addField(pkt, "Green %",  "%",   currentData.greenPercentage, 0);
     // ----------------------------------------------------------------
     addField(pkt, "TDS Pump", "",    digitalRead(TDS_PUMP)  == LOW ? 1.0f : 0.0f, 1);
     addField(pkt, "pH Pump1", "",    digitalRead(PH_PUMP_1) == LOW ? 1.0f : 0.0f, 1);
     addField(pkt, "pH Pump2", "",    digitalRead(PH_PUMP_2) == LOW ? 1.0f : 0.0f, 1);
+    addField(pkt, "LED",      "",    (currentData.isGreen || manualLED) ? 1.0f : 0.0f, 1);
     
     Serial.printf("[ESP-NOW] pkt.fieldCount=%d groupName='%s'\n", pkt.fieldCount, pkt.groupName);
     esp_now_send(receiverMAC, (uint8_t*)&pkt, sizeof(pkt));
@@ -187,6 +184,31 @@ void setup() {
   } else {
     Serial.println("\nWiFi failed.");
   }
+
+  // ── Initialize ESP-NOW ────────────────────────────────────
+  WiFi.mode(WIFI_AP_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] INIT FAILED!");
+    return;
+  }
+  Serial.println("[ESP-NOW] Initialized");
+
+  // Register send callback
+  esp_now_register_send_cb(esp_now_send_cb_t(OnEspNowSent));
+
+  // Configure receiver peer
+  memset(&espNowPeer, 0, sizeof(espNowPeer));
+  memcpy(espNowPeer.peer_addr, receiverMAC, 6);
+  espNowPeer.channel = 0;
+  espNowPeer.encrypt = false;
+  espNowPeer.ifidx   = WIFI_IF_STA;
+
+  if (esp_now_add_peer(&espNowPeer) != ESP_OK) {
+    Serial.println("[ESP-NOW] Failed to add receiver peer");
+    return;
+  }
+  Serial.println("[ESP-NOW] Receiver peer added");
+  espNowReady = true;
 
   Serial.println(">>> SYSTEM READY <<<");
 }
@@ -248,6 +270,8 @@ void loop() {
     currentData.gFreq = gCount;
     currentData.bFreq = bCount;
     currentData.colorStatus = colorStatus;
+    currentData.greenPercentage = greenScore;
+    currentData.isGreen = isGreen;
 
     // ── TDS Sensor ────────────────────────────────────────────
     int tdsRaw = analogRead(TDS_PIN);
@@ -386,6 +410,7 @@ void handleData() {
   doc["g_frequency"]  = currentData.gFreq;
   doc["b_frequency"]  = currentData.bFreq;
   doc["color_status"] = currentData.colorStatus;
+  doc["green_pct"]    = currentData.greenPercentage;
   doc["tds_value"]    = currentData.tdsValue;
   doc["tds_status"]   = currentData.tdsStatus;
   doc["ph_value"]     = currentData.phValue;
@@ -511,12 +536,9 @@ void handleRoot() {
   html += "<div class='card-head-left'><div class='chip chip-rgb'>RGB</div><span class='card-title'>Color Sensor</span></div>";
   html += "<span id='colorPill' class='pill pill-gray'>STANDBY</span>";
   html += "</div>";
-  html += "<div class='data-row'><span class='data-label'>Red Frequency</span><span class='data-value' id='rFreq'>-</span></div>";
-  html += "<div class='data-row'><span class='data-label'>Green Frequency</span><span class='data-value' id='gFreq'>-</span></div>";
-  html += "<div class='data-row'><span class='data-label'>Blue Frequency</span><span class='data-value' id='bFreq'>-</span></div>";
-  html += "<div class='bar-wrap'><div class='bar-track'><div class='bar-fill bar-red' id='rBar' style='width:50%'></div></div></div>";
-  html += "<div class='bar-wrap'><div class='bar-track'><div class='bar-fill bar-blue' id='bBar' style='width:50%'></div></div></div>";
-  html += "<div class='bar-wrap'><div class='bar-track'><div class='bar-fill bar-green' id='gBar' style='width:50%'></div></div></div>";
+  html += "<div class='data-row'><span class='data-label'>Green Percentage</span><span class='data-value' id='greenPct'>-<span class='unit'>%</span></span></div>";
+  html += "<div class='bar-wrap' style='margin-top:20px'><div class='bar-track' style='height:48px;border-radius:8px;background:rgba(34,197,94,0.06);border:1px solid rgba(34,197,94,0.12);'>";
+  html += "<div class='bar-fill bar-green' id='greenBar' style='width:0%;height:100%;border-radius:8px;opacity:0.7;'></div></div></div>";
   html += "<div class='out-box'><div class='out-box-title'>Output Status</div>";
   html += "<div class='out-row'><span class='out-label'>LED Strip</span><span class='out-tag out-idle' id='ledState'>WHITE &mdash; STANDBY</span></div>";
   html += "</div></div>";
@@ -599,13 +621,9 @@ void handleRoot() {
 
   // ── Color sensor
   html += "var r=d.r_frequency||0,g=d.g_frequency||0,b=d.b_frequency||0;";
-  html += "document.getElementById('rFreq').innerHTML=r;";
-  html += "document.getElementById('gFreq').innerHTML=g;";
-  html += "document.getElementById('bFreq').innerHTML=b;";
-  html += "var mx=Math.max(r,g,b,1);";
-  html += "document.getElementById('rBar').style.width=clamp(r/mx*100,2,100)+'%';";
-  html += "document.getElementById('gBar').style.width=clamp(g/mx*100,2,100)+'%';";
-  html += "document.getElementById('bBar').style.width=clamp(b/mx*100,2,100)+'%';";
+  html += "var greenPct=d.green_pct||0;";
+  html += "document.getElementById('greenPct').innerHTML=greenPct.toFixed(1)+' %';";
+  html += "document.getElementById('greenBar').style.width=Math.min(greenPct,100)+'%';";
   html += "if(d.color_status&&d.color_status.indexOf('GREEN')>=0){";
   html += "  setCard('colorCard','alert-red');setPill('colorPill','pill-red','GREEN DETECTED');";
   html += "  setOutTag('ledState','out-active','RED ALERT');setHW('hwLED','hw-alert','ALERT');";
